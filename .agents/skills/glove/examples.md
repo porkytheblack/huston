@@ -1,0 +1,910 @@
+# Glove Example Patterns
+
+Real patterns drawn from the example implementations in `examples/`.
+
+## Example Overview
+
+| Example | Type | Stack | Key Patterns |
+|---------|------|-------|-------------|
+| `examples/weather-agent` | Terminal CLI | Ink + glove-core | Local MemoryStore, AnthropicAdapter, pushAndWait for input, pushAndForget for display |
+| `examples/coding-agent` | Full-stack | Node server + React SPA | SqliteStore, WebSocket bridge, 14 tools, permission system, planning workflow |
+| `examples/nextjs-agent` | Web app | Next.js + glove-react | `defineTool`, `<Render>`, `renderResult`, `displayStrategy`, trip planning |
+| `examples/coffee` | Web app | Next.js + glove-react + glove-voice | `defineTool`, `<Render>`, `renderResult`, `displayStrategy`, e-commerce flow, cart state, voice interaction |
+| `examples/lola` | Web app | Next.js + glove-react + glove-voice | Voice-first movie companion, 9 TMDB tools, SileroVAD, `pushAndForget` only, cinematic UI |
+
+---
+
+## Pattern: Minimal Next.js Setup (nextjs-agent / coffee)
+
+**Server — one line (coffee example):**
+```typescript
+// app/api/chat/route.ts
+import { createChatHandler } from "glove-next";
+export const POST = createChatHandler({
+  provider: "anthropic",
+  model: "claude-sonnet-4-20250514",
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+```
+
+**Client — GloveClient with `defineTool`:**
+```tsx
+// app/lib/glove.tsx
+import { GloveClient, defineTool } from "glove-react";
+import { z } from "zod";
+
+const inputSchema = z.object({
+  question: z.string(),
+  options: z.array(z.object({ label: z.string(), value: z.string() })),
+});
+
+const askPreference = defineTool({
+  name: "ask_preference",
+  description: "Ask user to pick from options",
+  inputSchema,
+  displayPropsSchema: inputSchema,
+  resolveSchema: z.string(),
+  displayStrategy: "hide-on-complete",
+  async do(input, display) {
+    const selected = await display.pushAndWait(input);
+    return {
+      status: "success" as const,
+      data: `User selected: ${selected}`,
+      renderData: { question: input.question, selected },
+    };
+  },
+  render({ props, resolve }) {
+    return (
+      <div>
+        <p>{props.question}</p>
+        {props.options.map(opt => (
+          <button key={opt.value} onClick={() => resolve(opt.value)}>
+            {opt.label}
+          </button>
+        ))}
+      </div>
+    );
+  },
+  renderResult({ data }) {
+    const { question, selected } = data as { question: string; selected: string };
+    return <div><p>{question}</p><span>Selected: {selected}</span></div>;
+  },
+});
+
+export const gloveClient = new GloveClient({
+  endpoint: "/api/chat",
+  systemPrompt: "You are a helpful assistant...",
+  tools: [askPreference],
+});
+```
+
+---
+
+## Pattern: Tool Factory with Shared State (coffee)
+
+When tools need shared state (e.g., a shopping cart), use a factory pattern:
+
+```typescript
+// lib/theme.ts (re-exported from lib/tools/index.ts)
+interface CartOps {
+  add: (productId: string, quantity?: number) => void;
+  get: () => CartItem[];
+  clear: () => void;
+}
+
+export function createCoffeeTools(cartOps: CartOps): ToolConfig[] {
+  return [
+    createShowProductsTool(cartOps),
+    createAddToCartTool(cartOps),
+    createShowCartTool(cartOps),
+    createCheckoutTool(cartOps),
+    // ...
+  ];
+}
+
+function createAddToCartTool(cartOps: CartOps): ToolConfig {
+  return {
+    name: "add_to_cart",
+    description: "Add a product to the user's shopping bag.",
+    inputSchema: z.object({
+      product_id: z.string().describe("The product ID to add"),
+      quantity: z.number().optional().default(1).describe("Quantity to add (default 1)"),
+    }),
+    async do(input) {
+      const { product_id, quantity } = input as { product_id: string; quantity: number };
+      const product = getProductById(product_id);
+      if (!product) return "Product not found.";
+      cartOps.add(product_id, quantity);
+      const cart = cartOps.get();
+      const totalItems = cart.reduce((s, i) => s + i.qty, 0);
+      const totalPrice = cart.reduce((s, i) => s + i.price * i.qty, 0);
+      return `Added ${quantity}x ${product.name} to bag. Cart: ${totalItems} item(s), ${formatPrice(totalPrice)}.`;
+    },
+  };
+}
+```
+
+---
+
+## Pattern: Server-Side Agent with WebSocket Bridge (coding-agent)
+
+For agents with server-side tools (file I/O, bash, git), use glove-core directly:
+
+```typescript
+// server.ts
+import { Glove, SqliteStore, Displaymanager, createAdapter } from "glove-core";
+
+function createSession(sessionId: string, cwd: string) {
+  const store = new SqliteStore({ dbPath: "./agent.db", sessionId });
+  const model = createAdapter({ provider: "anthropic", stream: true });
+  const display = new Displaymanager();
+
+  const glove = new Glove({
+    store, model, displayManager: display,
+    systemPrompt: buildSystemPrompt(cwd),
+    compaction_config: { compaction_instructions: "Summarize...", max_turns: 50 },
+  });
+
+  // Register tools with path resolution
+  for (const tool of serverTools) {
+    glove.fold({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.input_schema,
+      requiresPermission: DESTRUCTIVE_TOOLS.has(tool.name),
+      do: (input) => {
+        if (typeof input.path === "string" && !input.path.startsWith("/")) {
+          input.path = resolve(cwd, input.path);
+        }
+        return tool.run(input);
+      },
+    });
+  }
+
+  // Bridge events to WebSocket
+  glove.addSubscriber({
+    async record(event_type, data) {
+      ws.send(JSON.stringify({ type: event_type, ...data }));
+    },
+  });
+
+  return glove.build();
+}
+```
+
+---
+
+## Pattern: Subscriber Bridge for Streaming UI
+
+Handle subscriber events to bridge between the agent and your UI layer. The key events are:
+
+```typescript
+class BridgeSubscriber implements SubscriberAdapter {
+  async record(event_type: string, data: any) {
+    switch (event_type) {
+      case "text_delta":
+        // Streaming text — append to current response buffer
+        process.stdout.write(data.text);
+        break;
+      case "tool_use":
+        // Tool call started — data has { id, name, input }
+        console.log(`Calling tool: ${data.name}`);
+        break;
+      case "tool_use_result":
+        // Tool finished — data has { tool_name, call_id, result: { status, data } }
+        console.log(`Tool ${data.tool_name}: ${data.result.status}`);
+        break;
+      case "model_response":
+      case "model_response_complete":  // IMPORTANT: handle BOTH
+        // Turn complete — data has { tokens_in, tokens_out, text, tool_calls }
+        this.addTurn(data.tokens_in, data.tokens_out);
+        break;
+    }
+  }
+}
+```
+
+**Note**: Streaming adapters emit `model_response_complete`, sync adapters emit `model_response`. Always handle both.
+
+---
+
+## Pattern: Permission-Gated Destructive Tools
+
+```typescript
+const DESTRUCTIVE_TOOLS = new Set(["write_file", "edit_file", "bash"]);
+
+glove.fold({
+  name: "bash",
+  description: "Execute a shell command",
+  inputSchema: z.object({ command: z.string(), timeout: z.number().optional() }),
+  requiresPermission: true,  // Triggers Displaymanager pushAndWait for approval
+  async do(input) {
+    const timeout = (input.timeout ?? 30) * 1000;
+    const { stdout, stderr, code } = await execAsync(input.command, { timeout });
+    return { stdout, stderr, exitCode: code };
+  },
+});
+```
+
+---
+
+## Pattern: Terminal UI with Ink (weather-agent)
+
+```tsx
+import {
+  type StoreAdapter,
+  type SubscriberAdapter,
+  Displaymanager,
+  AnthropicAdapter,
+  Glove,
+} from "glove-core";
+import { render, Text, Box } from "ink";
+
+// weather-agent defines MemoryStore locally (not imported from glove-react)
+class MemoryStore implements StoreAdapter { /* ... */ }
+
+const store = new MemoryStore("weather-agent");
+const model = new AnthropicAdapter({
+  model: "claude-sonnet-4-5-20250929",
+  maxTokens: 2048,
+  stream: true,
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+const display = new Displaymanager();
+
+const glove = new Glove({
+  store, model, displayManager: display,
+  systemPrompt: "You are a weather assistant.",
+  compaction_config: { compaction_instructions: "Summarize...", max_turns: 20 },
+});
+
+glove.fold({
+  name: "check_weather",
+  description: "Get weather for a location",
+  inputSchema: z.object({ location: z.string().optional() }),
+  async do(input, display) {
+    let location = input.location;
+    if (!location) {
+      // Ask user interactively — pushAndWait blocks until user responds
+      location = String(await display.pushAndWait({
+        renderer: "input",
+        input: { message: "Where do you want to check the weather?", placeholder: "e.g. Tokyo" },
+      })).trim();
+    }
+    const weather = await fetchWeather(location);
+    await display.pushAndForget({ renderer: "weather_card", input: weather });
+    // Return formatted string, not raw object
+    return `Weather in ${weather.location}: ${weather.temp}°C, ${weather.condition}.`;
+  },
+});
+
+glove.addSubscriber(subscriber);
+const agent = glove.build();
+```
+
+---
+
+## Pattern: Type-Safe Tools with `defineTool`
+
+Use `defineTool` for tools with display UI. It provides typed `props`, typed `resolve`, and typed `display.pushAndWait`:
+
+```tsx
+import { defineTool } from "glove-react";
+import { z } from "zod";
+
+const inputSchema = z.object({
+  question: z.string(),
+  options: z.array(z.object({ label: z.string(), value: z.string() })),
+});
+
+const askPreferenceTool = defineTool({
+  name: "ask_preference",
+  description: "Present options for user selection",
+  inputSchema,
+  displayPropsSchema: inputSchema,         // Same shape as input for this tool
+  resolveSchema: z.string(),               // User returns a string value
+  displayStrategy: "hide-on-complete",     // Hide after user responds
+  async do(input, display) {
+    const selected = await display.pushAndWait(input);  // TypedDisplay — typed!
+    const option = input.options.find(o => o.value === selected);
+    return {
+      status: "success" as const,
+      data: `User selected: ${selected}`,          // Sent to AI model
+      renderData: { question: input.question, selected: option },  // Client-only
+    };
+  },
+  render({ props, resolve }) {  // props is typed from displayPropsSchema
+    return (
+      <div>
+        <p>{props.question}</p>
+        {props.options.map(opt => (
+          <button key={opt.value} onClick={() => resolve(opt.value)}>
+            {opt.label}
+          </button>
+        ))}
+      </div>
+    );
+  },
+  renderResult({ data }) {  // Renders from history using renderData
+    const { question, selected } = data as {
+      question: string;
+      selected: { label: string; value: string };
+    };
+    return (
+      <div>
+        <p>{question}</p>
+        <span style={{ fontWeight: 600 }}>{selected.label}</span>
+      </div>
+    );
+  },
+});
+```
+
+Tools without display stay as raw `ToolConfig`:
+
+```typescript
+const getDateTool: ToolConfig = {
+  name: "get_date",
+  description: "Get today's date",
+  inputSchema: z.object({}),
+  async do() {
+    return { status: "success", data: new Date().toLocaleDateString() };
+  },
+};
+```
+
+---
+
+## Pattern: Headless Rendering with `<Render>`
+
+The `<Render>` component replaces manual `timeline.map()` / `slots.map(renderSlot)` rendering:
+
+```tsx
+import { useGlove, Render } from "glove-react";
+import type { MessageRenderProps, StreamingRenderProps, ToolStatusRenderProps } from "glove-react";
+
+function renderMessage({ entry }: MessageRenderProps) {
+  return (
+    <div className={entry.kind === "user" ? "user-msg" : "agent-msg"}>
+      {entry.text}
+    </div>
+  );
+}
+
+function renderToolStatus({ entry, hasSlot }: ToolStatusRenderProps) {
+  if (hasSlot) return null;  // Hide when slot/renderResult is showing
+  return <div className="tool-pill">{entry.name}: {entry.status}</div>;
+}
+
+export default function Chat() {
+  const glove = useGlove();
+
+  return (
+    <Render
+      glove={glove}
+      strategy="interleaved"
+      renderMessage={renderMessage}
+      renderToolStatus={renderToolStatus}
+      renderStreaming={({ text }) => <div className="streaming">{text}</div>}
+      renderInput={({ send, busy }) => (
+        <input
+          disabled={busy}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") { send(e.currentTarget.value); e.currentTarget.value = ""; }
+          }}
+        />
+      )}
+    />
+  );
+}
+```
+
+**`<Render>` automatically:**
+- Filters slot visibility based on `displayStrategy`
+- Renders `renderResult` for completed tools with `renderData`
+- Interleaves slots inline next to their tool call entry
+
+---
+
+## Pattern: Display Strategies
+
+Control when slots are visible:
+
+```tsx
+// hide-on-complete — for interactive tools (forms, pickers, confirmations)
+defineTool({
+  displayStrategy: "hide-on-complete",
+  async do(input, display) {
+    const result = await display.pushAndWait(input);  // Slot visible while waiting
+    // After resolve, slot is hidden. renderResult takes over from history.
+    return { status: "success", data: "...", renderData: { result } };
+  },
+  renderResult({ data }) { /* compact read-only view */ },
+});
+
+// hide-on-new — for status panels that should only show the latest
+defineTool({
+  displayStrategy: "hide-on-new",
+  async do(input, display) {
+    await display.pushAndForget(input);  // Previous cart slot is auto-hidden
+    return { status: "success", data: "...", renderData: input };
+  },
+});
+
+// stay (default) — for persistent info cards
+defineTool({
+  displayStrategy: "stay",  // or omit — "stay" is the default
+  async do(input, display) {
+    await display.pushAndForget(input);  // Card stays visible forever
+    return { status: "success", data: "...", renderData: input };
+  },
+});
+```
+
+---
+
+## Pattern: renderData + renderResult for History
+
+The `renderData` / `renderResult` pattern enables rendering tool results from history (e.g. after page reload):
+
+```tsx
+defineTool({
+  name: "checkout",
+  displayStrategy: "hide-on-complete",
+  async do(input, display) {
+    const cart = getCart();
+    const result = await display.pushAndWait({ items: cart });
+    if (!result) return { status: "success", data: "Cancelled", renderData: { cancelled: true } };
+
+    // Email stays in renderData (client-only) — NOT sent to the AI model
+    return {
+      status: "success",
+      data: `Order placed. ${cart.length} items.`,      // AI sees this
+      renderData: { email: result.email, items: cart },  // Client-only
+    };
+  },
+  renderResult({ data }) {
+    const d = data as any;
+    if (d.cancelled) return <p>Checkout cancelled</p>;
+    return <div>Order confirmed — {d.email}</div>;
+  },
+});
+```
+
+**Data flow:**
+1. `do()` returns `{ status, data, renderData }`
+2. `data` → sent to AI model (via model adapter)
+3. `renderData` → stripped by model adapter, stored in message history
+4. On reload, `renderResult({ data: renderData })` renders the history view
+
+---
+
+## Pattern: Colocated Renderers with pushAndWait + pushAndForget
+
+From the coffee example — a tool that shows products AND waits for selection, using `defineTool`:
+
+```tsx
+const inputSchema = z.object({
+  product_ids: z.array(z.string()),
+  prompt: z.string().optional(),
+});
+
+const resolveSchema = z.object({
+  productId: z.string(),
+  action: z.enum(["select", "add"]),
+});
+
+const showProductsTool = defineTool({
+  name: "show_products",
+  description: "Display product cards for browsing",
+  inputSchema,
+  displayPropsSchema: inputSchema,
+  resolveSchema,
+  displayStrategy: "hide-on-complete",
+  async do(input, display) {
+    const selected = await display.pushAndWait(input);
+    const product = getProductById(selected.productId);
+    return {
+      status: "success" as const,
+      data: `User ${selected.action === "add" ? "added" : "selected"} ${product.name}`,
+      renderData: { productName: product.name, action: selected.action, price: product.price },
+    };
+  },
+  render({ props, resolve }) {
+    const products = getProductsByIds(props.product_ids);
+    return (
+      <div style={{ display: "flex", gap: 12, overflowX: "auto" }}>
+        {products.map(p => (
+          <div key={p.id}>
+            <h4>{p.name}</h4>
+            <p>{p.origin} — ${p.price}</p>
+            <button onClick={() => resolve({ productId: p.id, action: "select" })}>Select</button>
+            <button onClick={() => resolve({ productId: p.id, action: "add" })}>Add to bag</button>
+          </div>
+        ))}
+      </div>
+    );
+  },
+  renderResult({ data }) {
+    const { action, productName, price } = data as any;
+    return <div>{action === "add" ? "Added" : "Selected"} {productName} — ${price}</div>;
+  },
+});
+```
+
+---
+
+## Pattern: Dynamic System Prompts with Product Catalogs
+
+```typescript
+const productCatalog = PRODUCTS.map(p =>
+  `- ${p.name} (${p.id}): ${p.origin}, ${p.roast} roast, ${formatPrice(p.price)}/${p.weight}. Notes: ${p.notes.join(", ")}. Intensity: ${p.intensity}/10. ${p.description}`
+).join("\n");
+
+const systemPrompt = `You are a friendly, knowledgeable coffee barista at Glove Coffee.
+
+## Product Catalog
+${productCatalog}
+
+## Your Workflow
+1. Greet the customer warmly. Ask what they're in the mood for.
+2. Use ask_preference to gather preferences progressively — don't ask everything at once.
+3. Based on preferences, use show_products to display 2-3 recommendations.
+4. When they select a product, use show_product_detail for the full card.
+5. Use add_to_cart when they confirm.
+6. When ready, use checkout to present the order form.
+7. After checkout, use show_info with variant "success" to confirm.
+
+## Tool Usage Guidelines
+- ALWAYS use interactive tools (ask_preference, show_products) instead of listing in plain text
+- Use show_info for sourcing details, brewing tips, or order confirmations
+- Keep text responses short — 1-2 sentences between tool calls
+- When recommending, explain briefly WHY these products match their preferences`;
+```
+
+---
+
+## Pattern: Abort Handling
+
+```typescript
+const controller = new AbortController();
+
+try {
+  const result = await glove.processRequest("Plan my trip", controller.signal);
+} catch (err) {
+  if (err instanceof AbortError) {
+    console.log("User cancelled");
+  }
+}
+
+// To cancel:
+controller.abort();
+```
+
+In React:
+```tsx
+const { abort } = useGlove();
+<button onClick={abort}>Stop</button>
+```
+
+---
+
+## Pattern: Model Switching at Runtime
+
+```typescript
+// Server-side
+const newModel = createAdapter({ provider: "openai", model: "gpt-4.1", stream: true });
+glove.setModel(newModel);
+
+// Via useGlove override
+const { sendMessage } = useGlove({
+  model: createEndpointModel("/api/chat-gpt4"),
+});
+```
+
+---
+
+## Pattern: Voice Integration (Coffee / Lola)
+
+Both coffee and lola examples demonstrate full voice integration. The pattern is:
+
+### 1. Token Routes
+
+```typescript
+// app/api/voice/stt-token/route.ts
+import { createVoiceTokenHandler } from "glove-next";
+export const GET = createVoiceTokenHandler({ provider: "elevenlabs", type: "stt" });
+
+// app/api/voice/tts-token/route.ts
+import { createVoiceTokenHandler } from "glove-next";
+export const GET = createVoiceTokenHandler({ provider: "elevenlabs", type: "tts" });
+```
+
+### 2. Client Voice Adapters
+
+```typescript
+// app/lib/voice.ts
+import { createElevenLabsAdapters } from "glove-voice";
+
+async function fetchToken(path: string): Promise<string> {
+  const res = await fetch(path);
+  const data = await res.json();
+  return data.token;
+}
+
+export const { stt, createTTS } = createElevenLabsAdapters({
+  getSTTToken: () => fetchToken("/api/voice/stt-token"),
+  getTTSToken: () => fetchToken("/api/voice/tts-token"),
+  voiceId: "JBFqnCBsd6RMkjVDRZzb",
+});
+
+// SileroVAD — dynamic import for SSR safety
+export async function createSileroVAD() {
+  const { SileroVADAdapter } = await import("glove-voice/silero-vad");
+  const vad = new SileroVADAdapter({
+    positiveSpeechThreshold: 0.5,
+    negativeSpeechThreshold: 0.35,
+    wasm: { type: "cdn" },
+  });
+  await vad.init();
+  return vad;
+}
+```
+
+### 3. useGloveVoice Hook
+
+```tsx
+import { useGlove } from "glove-react";
+import { useGloveVoice } from "glove-react/voice";
+import { stt, createTTS, createSileroVAD } from "@/lib/voice";
+
+function App() {
+  const { runnable } = useGlove({ tools, sessionId });
+
+  // Init VAD on mount
+  const vadRef = useRef(null);
+  const [vadReady, setVadReady] = useState(false);
+  useEffect(() => {
+    createSileroVAD().then((v) => { vadRef.current = v; setVadReady(true); });
+  }, []);
+
+  const voice = useGloveVoice({
+    runnable,
+    voice: { stt, createTTS, vad: vadReady ? vadRef.current : undefined },
+  });
+
+  // voice.mode: "idle" | "listening" | "thinking" | "speaking"
+  // voice.start(), voice.stop(), voice.interrupt(), voice.commitTurn()
+}
+```
+
+---
+
+## Pattern: Voice-First Tools (Lola)
+
+In voice-first apps, all tools use `pushAndForget` (never `pushAndWait`). Tool results return descriptive text for the LLM to narrate:
+
+```typescript
+const searchMoviesTool = defineTool({
+  name: "search_movies",
+  description: "Search for movies by title or keywords",
+  inputSchema: z.object({ query: z.string() }),
+  displayPropsSchema: z.object({ movies: z.array(z.any()) }),
+  displayStrategy: "hide-on-new",
+  async do(input, display) {
+    const movies = await searchMovies(input.query);
+    await display.pushAndForget({ movies });
+    return {
+      status: "success" as const,
+      data: movies.slice(0, 5).map(m =>
+        `${m.title} (${m.release_date?.slice(0, 4)}) — ${m.vote_average}/10`
+      ).join("; "),
+      renderData: { movies },
+    };
+  },
+  render({ props }) {
+    return <PosterGrid movies={props.movies} />;
+  },
+  renderResult({ data }) {
+    return <PosterGrid movies={(data as any).movies} />;
+  },
+});
+```
+
+---
+
+## Pattern: Dynamic System Prompt for Voice
+
+Switch between text and voice system prompts based on voice state:
+
+```typescript
+const basePrompt = "You are a helpful barista assistant...";
+
+const voiceInstructions = `
+Voice mode is active. The user is speaking to you.
+- Keep responses under 2 sentences
+- Narrate tool results concisely
+- Use natural conversational language
+- Do not use markdown, lists, or formatting
+`;
+
+function App() {
+  const voice = useGloveVoice({ runnable, voice: voiceConfig });
+  const systemPrompt = voice.isActive ? basePrompt + voiceInstructions : basePrompt;
+  const glove = useGlove({ systemPrompt, tools, sessionId });
+}
+```
+
+---
+
+## Pattern: Thinking Sound
+
+Play an ambient sound while the agent is thinking (between user utterance and agent response):
+
+```typescript
+const thinkingAudio = useRef<HTMLAudioElement | null>(null);
+
+useEffect(() => {
+  if (voice.mode === "thinking") {
+    thinkingAudio.current = new Audio("/thinking.mp3");
+    thinkingAudio.current.loop = true;
+    thinkingAudio.current.volume = 0.3;
+    thinkingAudio.current.play();
+  } else {
+    thinkingAudio.current?.pause();
+    thinkingAudio.current = null;
+  }
+}, [voice.mode]);
+```
+
+---
+
+## Pattern: Barge-in Protection with unAbortable
+
+Full barge-in protection for mutation-critical tools (like checkout) requires **two layers**:
+
+**Layer 1 — Voice barge-in suppression:** GloveVoice checks `displayManager.resolverStore.size > 0` before calling `interrupt()` during `speech_start`. If a `pushAndWait` resolver is pending (the form is open), barge-in is suppressed entirely.
+
+**Layer 2 — Abort signal resistance:** Setting `unAbortable: true` on the tool makes glove-core skip the `abortablePromise` wrapper. Even if `interrupt()` fires (e.g. programmatically), the tool runs to completion.
+
+`pushAndWait` alone only suppresses the voice trigger — it does NOT make the tool survive an abort signal. Only `unAbortable: true` guarantees completion.
+
+```tsx
+// Coffee Shop checkout — both layers working together
+const checkout = defineTool({
+  name: "checkout",
+  unAbortable: true,              // Layer 2: survives abort signals
+  displayStrategy: "hide-on-complete",
+  async do(_input, display) {
+    const result = await display.pushAndWait({ items });  // Layer 1: suppresses voice barge-in
+    if (!result) return "Cancelled";
+    cartOps.clear();              // Safe — tool guaranteed to complete
+    return "Order placed!";
+  },
+});
+```
+
+For voice-first apps (like Lola), prefer `pushAndForget` everywhere so barge-in always works naturally.
+
+---
+
+## Pattern: Narrating Display Slots
+
+Use `voice.narrate()` to speak arbitrary text through TTS without involving the model. This is ideal for reading aloud display slot content (e.g., order summaries, confirmation details):
+
+```tsx
+const checkout = defineTool({
+  name: "checkout",
+  unAbortable: true,
+  displayStrategy: "hide-on-complete",
+  async do(input, display) {
+    const cart = getCart();
+
+    // Narrate the cart summary before showing the form
+    await voice.narrate(
+      `Your order has ${cart.length} items totaling ${formatPrice(total)}.`
+    );
+
+    const result = await display.pushAndWait({ items: cart });
+    if (!result) return "Cancelled";
+
+    // Narrate the confirmation
+    await voice.narrate("Order placed! You'll receive a confirmation email shortly.");
+
+    cartOps.clear();
+    return "Order placed!";
+  },
+});
+```
+
+**Key points:**
+- `narrate()` resolves when all audio finishes playing
+- Auto-mutes mic during narration to prevent feedback into STT/VAD
+- Creates a fresh TTS adapter per call (same pattern as model turns)
+- Safe to call from `pushAndWait` tool handlers — the model is paused waiting for the tool result
+
+---
+
+## Pattern: Mic Mute/Unmute + Audio Visualization
+
+Use `mute()`/`unmute()` to gate mic audio forwarding to STT/VAD. The `audio_chunk` event still fires when muted, enabling waveform visualization:
+
+```tsx
+function VoiceControls() {
+  const voice = useGloveVoice({ runnable, voice: voiceConfig });
+  const [level, setLevel] = useState(0);
+
+  // Visualize audio levels (works even when muted)
+  useEffect(() => {
+    const gv = voiceRef.current;
+    if (!gv) return;
+    const handler = (pcm: Int16Array) => {
+      let sum = 0;
+      for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+      setLevel(Math.sqrt(sum / pcm.length) / 32768);
+    };
+    gv.on("audio_chunk", handler);
+    return () => { gv.off("audio_chunk", handler); };
+  }, [voice.isActive]);
+
+  return (
+    <div>
+      <AudioLevelBar level={level} />
+      <button onClick={voice.isMuted ? voice.unmute : voice.mute}>
+        {voice.isMuted ? "Unmute" : "Mute"}
+      </button>
+    </div>
+  );
+}
+```
+
+**Key points:**
+- `audio_chunk` emits raw `Int16Array` PCM from the mic, even when muted
+- Muting stops STT transcription and VAD detection without tearing down the capture pipeline
+- `isMuted` state is tracked in the React hook for UI binding
+
+---
+
+## Pattern: Compaction Loading Indicator
+
+Use `isCompacting` from `useGlove()` to show feedback during context compaction:
+
+```tsx
+function Chat() {
+  const { isCompacting, timeline, sendMessage } = useGlove();
+
+  return (
+    <div>
+      {timeline.map((entry, i) => /* render entries */)}
+      {isCompacting && (
+        <div className="compaction-indicator">
+          Compacting context...
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+Voice automatically silences TTS during compaction — no action needed on the voice side.
+
+---
+
+## Monorepo Structure
+
+```
+glove/
+├── packages/
+│   ├── glove/          # glove-core — runtime engine
+│   ├── react/          # glove-react — React bindings (GloveClient, useGlove, MemoryStore)
+│   ├── next/           # glove-next — Next.js handler (createChatHandler)
+│   ├── glove-voice/    # glove-voice — Voice pipeline (STT/TTS/VAD adapters)
+│   └── site/           # Documentation website (glove.dterminal.net)
+├── examples/
+│   ├── weather-agent/  # Terminal CLI with Ink
+│   ├── coding-agent/   # Full-stack with WebSocket server + React SPA
+│   ├── nextjs-agent/   # Next.js trip planner
+│   ├── coffee/         # Next.js coffee e-commerce + voice
+│   └── lola/           # Voice-first movie companion
+└── pnpm-workspace.yaml
+```

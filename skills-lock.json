@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "glove": {
+      "source": "porkytheblack/glove",
+      "sourceType": "github",
+      "computedHash": "9b49bb24a5c4f5b78aa774a36707a1c59c2060c9d8e6167545d14324bdf11b0c"
+    }
+  }
+}
